@@ -88,7 +88,7 @@ def train_reinforce(model, optimizer, env, n_episodes, discount_factor,  resume=
 
     
     if (resume and latest_reinforce_path.exists()):
-        checkpoint = torch.load(latest_reinforce_path, weights_only=True)
+        checkpoint = torch.load(latest_reinforce_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         totals = checkpoint["totals"]
@@ -210,7 +210,7 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
     
     start_episode = 0
     if (resume and latest_ac_path.exists()):
-        checkpoint = torch.load(latest_ac_path, weights_only=True)
+        checkpoint = torch.load(latest_ac_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         totals = checkpoint["totals"]
@@ -281,7 +281,7 @@ if __name__ == "__main__":
 
     if args.checkpoint is not None and Path(args.checkpoint).exists():
         try:
-            checkpoint = torch.load(args.checkpoint, weights_only=True)
+            checkpoint = torch.load(args.checkpoint, weights_only=False)
             model_type = checkpoint["model"]
             size = checkpoint["size"]
             depth = checkpoint["depth"]
