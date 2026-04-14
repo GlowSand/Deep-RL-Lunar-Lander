@@ -167,14 +167,14 @@ class ActorCritic(nn.Module):
 
 
 
-def ac_training_step(optimizer, criterion, state_value, target_value, log_prob, entropy, critic_weight=0.5, entropy_weight=0.0005):
+def ac_training_step(model, optimizer, criterion, state_value, target_value, log_prob, entropy, critic_weight=0.5, entropy_weight=0.0005):
     td_error = target_value - state_value
     actor_loss = -log_prob * td_error.detach() - entropy * entropy_weight
     critic_loss = criterion(state_value, target_value)
     loss = actor_loss + critic_weight * critic_loss
     optimizer.zero_grad()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
 
 def get_target_value(model, next_obs, reward, done, truncated, discount_factor):
@@ -185,24 +185,24 @@ def get_target_value(model, next_obs, reward, done, truncated, discount_factor):
     target_value = reward + running * discount_factor * next_state_value
     return target_value
 
-def run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, seed=None):
+def run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight, seed=None):
     obs, _info = env.reset(seed=seed)
     total_rewards = 0
     while True:
         action, log_prob, state_value, entropy = choose_action_and_evaluate(model, obs)
         next_obs, reward, done, truncated, _info = env.step(action)
         target_value = get_target_value(model, next_obs, reward, done, truncated, discount_factor)
-        ac_training_step(optimizer, criterion, state_value, target_value, log_prob, entropy, critic_weight)
+        ac_training_step(model, optimizer, criterion, state_value, target_value, log_prob, entropy, critic_weight, entropy_weight)
         total_rewards += reward
         if  done or truncated:
             return total_rewards
         obs = next_obs
 
-def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, resume=True):
+def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight=0.0005, resume=True):
     totals = []
     best_avg = -float("inf")
 
-    ac_dir_path = Path(f"ac_df{discount_factor}_cw{critic_weight:0.3f}_size{model.size}_depth{model.depth}_lr{optimizer.param_groups[0]['lr']:0.6f}")
+    ac_dir_path = Path(f"ac_df{discount_factor}_cw{critic_weight:0.3f}_size{model.size}_depth{model.depth}_lr{optimizer.param_groups[0]['lr']:0.6f}_ew{entropy_weight:0.6}")
 
     ac_dir_path.mkdir(exist_ok=True)
     
@@ -221,7 +221,7 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
     model.train()
     for episode in range(start_episode, n_episodes):
         seed = torch.randint(0, 2**32, size=()).item()
-        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, seed=seed)
+        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight,  seed=seed)
         totals.append(total_rewards)
 
         if len(totals) >= 100:
