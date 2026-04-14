@@ -173,6 +173,7 @@ def ac_training_step(optimizer, criterion, state_value, target_value, log_prob, 
     critic_loss = criterion(state_value, target_value)
     loss = actor_loss + critic_weight * critic_loss
     optimizer.zero_grad()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     loss.backward()
     optimizer.step()
 
