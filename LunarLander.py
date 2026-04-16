@@ -38,15 +38,23 @@ def basic_policy(obs): # Naive policy: use side engines to correct horizontal dr
 
 
 def choose_action(model, obs): #Action with no eval for REINFORCE
-    state = torch.as_tensor(obs)
+    state = torch.as_tensor(obs, dtype=torch.float32)
     logit = model(state)
     dist = torch.distributions.Categorical(logits=logit)
     action = dist.sample()
     log_prob = dist.log_prob(action)
     return int(action.item()), log_prob
 
+
+def choose_greedy_action_reinforce(model, obs): # Choose greedy for REINFORCE for testing
+    with torch.inference_mode():
+        state = torch.as_tensor(obs, dtype=torch.float32)
+        logits = model(state)
+        action = torch.argmax(logits).item()
+    return int(action)
+
 def choose_action_and_evaluate(model, obs): #Action with eval for AC
-    state = torch.as_tensor(obs)
+    state = torch.as_tensor(obs, dtype=torch.float32)
     logit, state_value = model(state)
     dist = torch.distributions.Categorical(logits=logit)
     entropy = dist.entropy()
@@ -54,6 +62,13 @@ def choose_action_and_evaluate(model, obs): #Action with eval for AC
     log_prob = dist.log_prob(action)
     return int(action.item()), log_prob, state_value, entropy
 
+
+def choose_greedy_action_ac(model, obs): # Choose greedy for AC for testing
+    with torch.inference_mode():
+        state = torch.as_tensor(obs, dtype=torch.float32)
+        logits, state_value = model(state)
+        action = torch.argmax(logits).item()
+    return int(action), state_value.item()
 
 def compute_returns(rewards, discount_factor):
     returns = rewards[:]
@@ -107,7 +122,7 @@ def train_reinforce(model, optimizer, env, n_episodes, discount_factor,  resume=
         loss = torch.stack(losses, dim=0).sum()
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
         if len(totals) >= 100:
             avg100 = np.mean(totals[-100:])
@@ -174,7 +189,7 @@ def ac_training_step(model, optimizer, criterion, state_value, target_value, log
     loss = actor_loss + critic_weight * critic_loss
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
 
 def get_target_value(model, next_obs, reward, done, truncated, discount_factor):
@@ -252,7 +267,7 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
         
         
                 
-        print(f"\rEpisode: {episode + 1}, Rewards: {total_rewards}", end=" ")
+        print(f"\r\rEpisode: {episode + 1}, Rewards: {total_rewards}, Total Rewards: {np.mean(totals[-100:])}", end=" ")
     model.eval()
     return totals
 
@@ -313,9 +328,9 @@ if __name__ == "__main__":
             if (model_type == "naive"):
                 action = basic_policy(obs)
             elif (model_type == "reinforce"):
-                action = choose_action(model, obs)[0]
+                action = choose_greedy_action_reinforce(model, obs)[0]
             elif (model_type == "ac"):
-                action = choose_action_and_evaluate(model, obs)[0]
+                action = choose_greedy_action_ac(model, obs)[0]
             obs, reward, done, truncated, info = env.step(action)
             if done or truncated:
                 break
