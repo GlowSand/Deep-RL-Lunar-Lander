@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from pathlib import Path
+from collections import deque
 
 # REINFORCE Policy Gradient Algorithm
 class PolicyNetwork(nn.Module):
@@ -88,9 +89,12 @@ def run_episode(model, env, seed=None): #Offline episode log prob and reward col
         if (done or truncated):
             return log_probs, rewards
 
+def get_reinforce_path(discount_factor, size, depth, lr):
+    return Path(f"reinforce_df{discount_factor}_size{size}_depth{depth}_lr{lr:0.6f}")
+
 def train_reinforce(model, optimizer, env, n_episodes, discount_factor,  resume=True):
     model.train()
-    reinforce_dir_path = Path(f"reinforce_df{discount_factor}_size{model.size}_depth{model.depth}_lr{optimizer.param_groups[0]['lr']:0.6f}")
+    reinforce_dir_path = get_reinforce_path(discount_factor, model.size, model.depth, optimizer.param_groups[0]['lr'])
 
     reinforce_dir_path.mkdir(exist_ok=True)
     
@@ -192,33 +196,134 @@ def ac_training_step(model, optimizer, criterion, state_value, target_value, log
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
 
-def get_target_value(model, next_obs, reward, done, truncated, discount_factor):
-    with torch.inference_mode():
-        _, _, next_state_value, _ = choose_action_and_evaluate(model, next_obs)
+def get_n_step_target(model, transition_buffer, discount_factor, n_steps):
+    device = next(model.parameters()).device
+    items = list(transition_buffer)[:n_steps]
 
-    running = 0.0 if (done or truncated) else 1.0
-    target_value = reward + running * discount_factor * next_state_value
+    target_value = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+    for i, item in enumerate(items):
+        target_value = target_value + (discount_factor ** i) * item["reward"]
+
+        if item["terminated"] or item["truncated"]:
+            return target_value
+
+    with torch.inference_mode():
+        next_state = torch.as_tensor(items[-1]["next_obs"], dtype=torch.float32, device=device)
+        _, next_state_value = model(next_state)
+
+    target_value = target_value + (discount_factor ** len(items)) * next_state_value
     return target_value
 
-def run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight, seed=None):
+def evaluate_given_action(model, obs, action):
+    state = torch.as_tensor(obs, dtype=torch.float32)
+    logits, state_value = model(state)
+    dist = torch.distributions.Categorical(logits=logits)
+
+    action_tensor = torch.tensor(action, dtype=torch.int64)
+    log_prob = dist.log_prob(action_tensor)
+    entropy = dist.entropy()
+
+    return log_prob, state_value, entropy
+
+def run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight, n_steps=5, seed=None):
     obs, _info = env.reset(seed=seed)
-    total_rewards = 0
+    total_rewards = 0.0
+    transition_buffer = deque()
+
     while True:
-        action, log_prob, state_value, entropy = choose_action_and_evaluate(model, obs)
-        next_obs, reward, done, truncated, _info = env.step(action)
-        target_value = get_target_value(model, next_obs, reward, done, truncated, discount_factor)
-        ac_training_step(model, optimizer, criterion, state_value, target_value, log_prob, entropy, critic_weight, entropy_weight)
+        action, _log_prob, _state_value, _entropy = choose_action_and_evaluate(model, obs)
+        next_obs, reward, terminated, truncated, _info = env.step(action)
         total_rewards += reward
-        if  done or truncated:
+
+        transition_buffer.append({
+            "obs": obs,
+            "action": action,
+            "reward": reward,
+            "next_obs": next_obs,
+            "terminated": terminated,
+            "truncated": truncated,
+        })
+
+        if len(transition_buffer) >= n_steps:
+            target_value = get_n_step_target(model, transition_buffer, discount_factor, n_steps)
+            oldest = transition_buffer.popleft()
+
+            log_prob, state_value, entropy = evaluate_given_action(
+                model,
+                oldest["obs"],
+                oldest["action"],
+            )
+
+            ac_training_step(
+                model,
+                optimizer,
+                criterion,
+                state_value,
+                target_value,
+                log_prob,
+                entropy,
+                critic_weight,
+                entropy_weight,
+            )
+
+        if terminated or truncated:
+            while transition_buffer:
+                target_value = get_n_step_target(
+                    model,
+                    transition_buffer,
+                    discount_factor,
+                    len(transition_buffer),
+                )
+                oldest = transition_buffer.popleft()
+
+                log_prob, state_value, entropy = evaluate_given_action(
+                    model,
+                    oldest["obs"],
+                    oldest["action"],
+                )
+
+                ac_training_step(
+                    model,
+                    optimizer,
+                    criterion,
+                    state_value,
+                    target_value,
+                    log_prob,
+                    entropy,
+                    critic_weight,
+                    entropy_weight,
+                )
+
             return total_rewards
+
         obs = next_obs
 
-def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight=0.0005, resume=True):
+def linear_anneal(start_value, end_value, current_step, anneal_steps):
+    if anneal_steps <= 0:
+        return start_value
+
+    progress = min(current_step / anneal_steps, 1.0)
+    return start_value + progress * (end_value - start_value)
+
+def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_start, entropy_weight_end, entropy_anneal_episodes, n_steps):
+    return Path(
+        f"ac_df{discount_factor}"
+        f"_cw{critic_weight:0.3f}"
+        f"_size{size}"
+        f"_depth{depth}"
+        f"_lr{lr:0.6f}"
+        f"_ews{entropy_weight_start:0.6f}"
+        f"_ewe{entropy_weight_end:0.6f}"
+        f"_ewa{entropy_anneal_episodes}"
+        f"_ns{n_steps}"
+    )
+
+def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight_start=0.001, entropy_weight_end=0.0001, entropy_anneal_episodes=400, n_steps=5, resume=True):
     totals = []
     best_avg = -float("inf")
 
-    ac_dir_path = Path(f"ac_df{discount_factor}_cw{critic_weight:0.3f}_size{model.size}_depth{model.depth}_lr{optimizer.param_groups[0]['lr']:0.6f}_ew{entropy_weight:0.6}")
-
+    ac_dir_path = get_ac_path(discount_factor, critic_weight, model.size, model.depth, optimizer.param_groups[0]['lr'], entropy_weight_start, entropy_weight_end, entropy_anneal_episodes, n_steps)
     ac_dir_path.mkdir(exist_ok=True)
     
     latest_ac_path = ac_dir_path / Path("latest_actor_critic.pt")
@@ -236,7 +341,13 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
     model.train()
     for episode in range(start_episode, n_episodes):
         seed = torch.randint(0, 2**32, size=()).item()
-        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight,  seed=seed)
+        current_entropy_weight = linear_anneal(
+            entropy_weight_start,
+            entropy_weight_end,
+            episode,
+            entropy_anneal_episodes,
+        )
+        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, current_entropy_weight, n_steps, seed=seed)
         totals.append(total_rewards)
 
         if len(totals) >= 100:
@@ -265,9 +376,13 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
                 "depth": model.depth
             }, latest_ac_path)
         
-        
                 
-        print(f"\r\rEpisode: {episode + 1}, Rewards: {total_rewards}, Total Rewards: {np.mean(totals[-100:])}", end=" ")
+        print(
+            f"\rEpisode: {episode + 1}, Reward: {total_rewards:.2f}, "
+            f"Avg100: {np.mean(totals[-100:]):.2f}, EW: {current_entropy_weight:.6f}",
+            end=""
+        )  
+
     model.eval()
     return totals
 
@@ -306,6 +421,8 @@ if __name__ == "__main__":
             print("Falling back to naive, could not load checkpoint")
     else:
         model_type = "naive"
+        print("Falling back to naive, could not load checkpoint")
+
 
         
         
@@ -320,18 +437,31 @@ if __name__ == "__main__":
     if model_type != "naive":
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
-    
+
+    final_totals = []    
     for episode in range(args.episodes):
         episode_seed = None if args.seed is None else args.seed + episode
         obs,info = env.reset(seed=episode_seed)
+        totals = []
         while True:
             if (model_type == "naive"):
                 action = basic_policy(obs)
             elif (model_type == "reinforce"):
-                action = choose_greedy_action_reinforce(model, obs)[0]
+                action = choose_greedy_action_reinforce(model, obs)
             elif (model_type == "ac"):
                 action = choose_greedy_action_ac(model, obs)[0]
             obs, reward, done, truncated, info = env.step(action)
+            totals.append(reward)
             if done or truncated:
                 break
+        mean = sum(totals)
+        print(f"Episode rewards total: {mean}")
+        final_totals.append(mean)
+
+    windows = np.max([100, episode])
+    print("Final convolve: ", np.convolve(final_totals, np.ones(window), 'valid') / window)
+    print("Final: ")
+    print(np.mean(final_totals),np.std(final_totals),min(final_totals),max(final_totals))
+
+    
     env.close()
