@@ -388,6 +388,384 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
 
 
 
+import random
+
+
+class DQN(nn.Module):
+    def __init__(self, size: int, depth: int):
+        super().__init__()
+        layers = []
+
+        self.size = size
+        self.depth = depth
+
+        if depth == 0:
+            self.net = nn.Sequential(nn.Linear(8, 4))
+        else:
+            layers.append(nn.Linear(8, size))
+            layers.append(nn.ReLU())
+            for _ in range(1, depth):
+                layers.append(nn.Linear(size, size))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(size, 4))
+            self.net = nn.Sequential(*layers)
+
+    def forward(self, state):
+        return self.net(state)
+
+
+def choose_action_dqn(model, obs, epsilon):
+    if np.random.random() < epsilon:
+        return int(np.random.randint(4))
+
+    with torch.inference_mode():
+        state = torch.as_tensor(obs, dtype=torch.float32)
+        q_values = model(state)
+        action = torch.argmax(q_values).item()
+    return int(action)
+
+def choose_action_dqn_with_ac(policy_model, ac_model, obs, epsilon, ac_guidance_prob=0.5):
+    if np.random.random() < epsilon:
+        return int(np.random.randint(4))
+
+    if ac_model is not None and np.random.random() < ac_guidance_prob:
+        return choose_greedy_action_ac(ac_model, obs)[0]
+
+    return choose_greedy_action_dqn(policy_model, obs)
+
+
+def choose_greedy_action_dqn(model, obs):
+    with torch.inference_mode():
+        state = torch.as_tensor(obs, dtype=torch.float32)
+        q_values = model(state)
+        action = torch.argmax(q_values).item()
+    return int(action)
+
+
+def sample_batch_dqn(replay_buffer, batch_size):
+    batch = random.sample(replay_buffer, batch_size)
+
+    states = torch.as_tensor(
+        np.array([item["obs"] for item in batch]),
+        dtype=torch.float32,
+    )
+    actions = torch.as_tensor(
+        [item["action"] for item in batch],
+        dtype=torch.int64,
+    )
+    rewards = torch.as_tensor(
+        [item["reward"] for item in batch],
+        dtype=torch.float32,
+    )
+    next_states = torch.as_tensor(
+        np.array([item["next_obs"] for item in batch]),
+        dtype=torch.float32,
+    )
+    dones = torch.as_tensor(
+        [item["terminated"] or item["truncated"] for item in batch],
+        dtype=torch.float32,
+    )
+
+    return states, actions, rewards, next_states, dones
+
+
+def dqn_training_step(policy_model, target_model, optimizer, criterion, replay_buffer, batch_size, discount_factor):
+    states, actions, rewards, next_states, dones = sample_batch_dqn(
+        replay_buffer,
+        batch_size,
+    )
+
+    q_values = policy_model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+
+    with torch.no_grad():
+        next_q_values = target_model(next_states).max(dim=1).values
+        target_values = rewards + discount_factor * next_q_values * (1.0 - dones)
+
+    loss = criterion(q_values, target_values)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 0.5)
+    optimizer.step()
+
+    return loss.item()
+
+
+def run_episode_and_train_dqn(
+    policy_model,
+    target_model,
+    optimizer,
+    criterion,
+    env,
+    replay_buffer,
+    batch_size,
+    discount_factor,
+    epsilon,
+    warmup_steps=1000,
+    train_freq=1,
+    target_update_freq=250,
+    seed=None,
+    global_step=0,
+    ac_model=None,
+    ac_guidance_prob=0.0,
+):
+    obs, _info = env.reset(seed=seed)
+    total_rewards = 0.0
+    episode_loss_sum = 0.0
+    episode_updates = 0
+
+    while True:
+        action = choose_action_dqn_with_ac(
+            policy_model,
+            ac_model,
+            obs,
+            epsilon,
+            ac_guidance_prob=ac_guidance_prob,
+        )
+
+        next_obs, reward, terminated, truncated, _info = env.step(action)
+        total_rewards += reward
+
+        replay_buffer.append({
+            "obs": obs,
+            "action": action,
+            "reward": reward,
+            "next_obs": next_obs,
+            "terminated": terminated,
+            "truncated": truncated,
+        })
+
+        global_step += 1
+
+        if len(replay_buffer) >= max(batch_size, warmup_steps) and global_step % train_freq == 0:
+            loss_value = dqn_training_step(
+                policy_model,
+                target_model,
+                optimizer,
+                criterion,
+                replay_buffer,
+                batch_size,
+                discount_factor,
+            )
+            episode_loss_sum += loss_value
+            episode_updates += 1
+
+        if global_step % target_update_freq == 0:
+            target_model.load_state_dict(policy_model.state_dict())
+
+        if terminated or truncated:
+            avg_loss = 0.0 if episode_updates == 0 else episode_loss_sum / episode_updates
+            return total_rewards, avg_loss, global_step
+
+        obs = next_obs
+
+
+def get_dqn_path(
+    discount_factor,
+    size,
+    depth,
+    lr,
+    buffer_size,
+    batch_size,
+    target_update_freq,
+    epsilon_start,
+    epsilon_end,
+    epsilon_decay_episodes,
+    ac_guidance_start=0.0,
+    ac_guidance_end=0.0,
+    ac_guidance_anneal_episodes=0,
+):
+    return Path(
+        f"dqn_df{discount_factor}"
+        f"_size{size}"
+        f"_depth{depth}"
+        f"_lr{lr:0.6f}"
+        f"_bs{buffer_size}"
+        f"_batch{batch_size}"
+        f"_tuf{target_update_freq}"
+        f"_epss{epsilon_start:0.4f}"
+        f"_epse{epsilon_end:0.4f}"
+        f"_epsd{epsilon_decay_episodes}"
+        f"_acgs{ac_guidance_start:0.2f}"
+        f"_acge{ac_guidance_end:0.2f}"
+        f"_acga{ac_guidance_anneal_episodes}"
+    )
+
+
+def train_dqn(
+    policy_model,
+    target_model,
+    optimizer,
+    criterion,
+    env,
+    n_episodes=400,
+    discount_factor=0.99,
+    buffer_size=100000,
+    batch_size=64,
+    target_update_freq=250,
+    epsilon_start=1.0,
+    epsilon_end=0.05,
+    epsilon_decay_episodes=300,
+    warmup_steps=1000,
+    train_freq=1,
+    resume=True,
+    save_replay_buffer=False,
+    ac_model=None,
+    ac_guidance_start=0.5,
+    ac_guidance_end=0.0,
+    ac_guidance_anneal_episodes=150,
+):
+    totals = []
+    losses = []
+    best_avg = -float("inf")
+    global_step = 0
+    replay_buffer = deque(maxlen=buffer_size)
+
+    dqn_dir_path = get_dqn_path(
+        discount_factor,
+        policy_model.size,
+        policy_model.depth,
+        optimizer.param_groups[0]["lr"],
+        buffer_size,
+        batch_size,
+        target_update_freq,
+        epsilon_start,
+        epsilon_end,
+        epsilon_decay_episodes,
+        ac_guidance_start=ac_guidance_start,
+        ac_guidance_end=ac_guidance_end,
+        ac_guidance_anneal_episodes=ac_guidance_anneal_episodes,
+    )
+    dqn_dir_path.mkdir(exist_ok=True)
+
+    latest_dqn_path = dqn_dir_path / Path("latest_dqn.pt")
+    best_dqn_path = dqn_dir_path / Path("best_dqn.pt")
+
+    start_episode = 0
+
+    if resume and latest_dqn_path.exists():
+        checkpoint = torch.load(latest_dqn_path, weights_only=False)
+        policy_model.load_state_dict(checkpoint["model_state_dict"])
+        target_model.load_state_dict(checkpoint["target_model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        totals = checkpoint["totals"]
+        losses = checkpoint.get("losses", [])
+        best_avg = checkpoint["best_avg"]
+        start_episode = checkpoint["episode"] + 1
+        global_step = checkpoint.get("global_step", 0)
+
+        if save_replay_buffer and "replay_buffer" in checkpoint:
+            replay_buffer = deque(checkpoint["replay_buffer"], maxlen=buffer_size)
+    else:
+        target_model.load_state_dict(policy_model.state_dict())
+
+    if ac_model is not None:
+        ac_model.eval()
+
+    policy_model.train()
+    target_model.eval()
+
+    for episode in range(start_episode, n_episodes):
+        seed = torch.randint(0, 2**32, size=()).item()
+
+        epsilon = linear_anneal(
+            epsilon_start,
+            epsilon_end,
+            episode,
+            epsilon_decay_episodes,
+        )
+    
+        current_ac_guidance = linear_anneal(
+            ac_guidance_start,
+            ac_guidance_end,
+            episode,
+            ac_guidance_anneal_episodes,
+        )
+    
+        total_rewards, avg_loss, global_step = run_episode_and_train_dqn(
+            policy_model,
+            target_model,
+            optimizer,
+            criterion,
+            env,
+            replay_buffer,
+            batch_size,
+            discount_factor,
+            epsilon,
+            warmup_steps=warmup_steps,
+            train_freq=train_freq,
+            target_update_freq=target_update_freq,
+            seed=seed,
+            global_step=global_step,
+            ac_model=ac_model,
+            ac_guidance_prob=current_ac_guidance,
+        )
+    
+        totals.append(total_rewards)
+        losses.append(avg_loss)
+
+        checkpoint_data = {
+            "episode": episode,
+            "model_state_dict": policy_model.state_dict(),
+            "target_model_state_dict": target_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "totals": totals,
+            "losses": losses,
+            "best_avg": best_avg,
+            "global_step": global_step,
+            "model": "dqn",
+            "size": policy_model.size,
+            "depth": policy_model.depth,
+            "ac_guidance_start": ac_guidance_start,
+            "ac_guidance_end": ac_guidance_end,
+            "ac_guidance_anneal_episodes": ac_guidance_anneal_episodes,
+        }
+
+        if save_replay_buffer:
+            checkpoint_data["replay_buffer"] = list(replay_buffer)
+
+        if len(totals) >= 100:
+            avg100 = np.mean(totals[-100:])
+            if avg100 > best_avg:
+                best_avg = avg100
+                checkpoint_data["best_avg"] = best_avg
+                torch.save(checkpoint_data, best_dqn_path)
+
+        torch.save(checkpoint_data, latest_dqn_path)
+
+        print(
+            f"\rEpisode: {episode + 1}, Reward: {total_rewards:.2f}, "
+            f"Avg100: {np.mean(totals[-100:]):.2f}, "
+            f"Eps: {epsilon:.4f}, ACG: {current_ac_guidance:.3f}, Loss: {avg_loss:.4f}",
+            end=""
+        )
+
+    policy_model.eval()
+    return totals, losses
+
+
+def load_model_for_eval(path):
+    checkpoint = torch.load(path, weights_only=False)
+    model_type = checkpoint["model"]
+    size = checkpoint["size"]
+    depth = checkpoint["depth"]
+    
+    if model_type == "reinforce":
+        model = PolicyNetwork(size, depth)
+    elif model_type == "ac":
+        model = ActorCritic(size, depth)
+    elif model_type == "dqn":
+        model = DQN(size, depth)
+        
+
+    checkpoint = torch.load(path, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    return model, model_type
+
+
+
 # If the script is ran by itself, use it to test a model
 if __name__ == "__main__": 
     import argparse
@@ -412,12 +790,10 @@ if __name__ == "__main__":
 
     if args.checkpoint is not None and Path(args.checkpoint).exists():
         try:
-            checkpoint = torch.load(args.checkpoint, weights_only=False)
-            model_type = checkpoint["model"]
-            size = checkpoint["size"]
-            depth = checkpoint["depth"]
+            model, model_type = load_model_for_eval(Path(args.checkpoint))
         except Exception as e:
             model_type = "naive"
+            print(e)
             print("Falling back to naive, could not load checkpoint")
     else:
         model_type = "naive"
@@ -429,14 +805,8 @@ if __name__ == "__main__":
 
     env = gym.make("LunarLander-v2", render_mode="human")
     
-    if model_type == "reinforce":
-        model = PolicyNetwork(size, depth)
-    elif model_type == "ac":
-        model = ActorCritic(size, depth)
+    
 
-    if model_type != "naive":
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
 
     final_totals = []    
     for episode in range(args.episodes):
@@ -450,6 +820,8 @@ if __name__ == "__main__":
                 action = choose_greedy_action_reinforce(model, obs)
             elif (model_type == "ac"):
                 action = choose_greedy_action_ac(model, obs)[0]
+            elif (model_type == "dqn"):
+                action = choose_greedy_action_dqn(model, obs)
             obs, reward, done, truncated, info = env.step(action)
             totals.append(reward)
             if done or truncated:
@@ -457,8 +829,8 @@ if __name__ == "__main__":
         mean = sum(totals)
         print(f"Episode rewards total: {mean}")
         final_totals.append(mean)
-
-    windows = np.max([100, episode])
+    
+    window = np.max([100, episode])
     print("Final convolve: ", np.convolve(final_totals, np.ones(window), 'valid') / window)
     print("Final: ")
     print(np.mean(final_totals),np.std(final_totals),min(final_totals),max(final_totals))
