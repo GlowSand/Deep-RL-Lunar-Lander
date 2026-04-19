@@ -196,24 +196,7 @@ def ac_training_step(model, optimizer, criterion, state_value, target_value, log
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
 
-def get_n_step_target(model, transition_buffer, discount_factor, n_steps):
-    device = next(model.parameters()).device
-    items = list(transition_buffer)[:n_steps]
 
-    target_value = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-    for i, item in enumerate(items):
-        target_value = target_value + (discount_factor ** i) * item["reward"]
-
-        if item["terminated"] or item["truncated"]:
-            return target_value
-
-    with torch.inference_mode():
-        next_state = torch.as_tensor(items[-1]["next_obs"], dtype=torch.float32, device=device)
-        _, next_state_value = model(next_state)
-
-    target_value = target_value + (discount_factor ** len(items)) * next_state_value
-    return target_value
 
 def evaluate_given_action(model, obs, action):
     state = torch.as_tensor(obs, dtype=torch.float32)
@@ -226,75 +209,47 @@ def evaluate_given_action(model, obs, action):
 
     return log_prob, state_value, entropy
 
-def run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, entropy_weight, n_steps=5, seed=None):
-    obs, _info = env.reset(seed=seed)
+def run_episode_and_train_ac(
+    model,
+    optimizer,
+    criterion,
+    env,
+    discount_factor,
+    critic_weight,
+    entropy_weight,
+    seed=None,
+):
+    obs, _ = env.reset(seed=seed)
     total_rewards = 0.0
-    transition_buffer = deque()
 
     while True:
-        action, _log_prob, _state_value, _entropy = choose_action_and_evaluate(model, obs)
-        next_obs, reward, terminated, truncated, _info = env.step(action)
+        action, log_prob, state_value, entropy = choose_action_and_evaluate(model, obs)
+        next_obs, reward, terminated, truncated, _ = env.step(action)
         total_rewards += reward
 
-        transition_buffer.append({
-            "obs": obs,
-            "action": action,
-            "reward": reward,
-            "next_obs": next_obs,
-            "terminated": terminated,
-            "truncated": truncated,
-        })
+        device = state_value.device
+        reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
 
-        if len(transition_buffer) >= n_steps:
-            target_value = get_n_step_target(model, transition_buffer, discount_factor, n_steps)
-            oldest = transition_buffer.popleft()
+        with torch.no_grad():
+            if terminated or truncated:
+                target_value = reward_t
+            else:
+                next_state = torch.as_tensor(next_obs, dtype=torch.float32, device=device)
+                _, next_state_value = model(next_state)
+                target_value = reward_t + discount_factor * next_state_value
 
-            log_prob, state_value, entropy = evaluate_given_action(
-                model,
-                oldest["obs"],
-                oldest["action"],
-            )
+        td_error = target_value - state_value
 
-            ac_training_step(
-                model,
-                optimizer,
-                criterion,
-                state_value,
-                target_value,
-                log_prob,
-                entropy,
-                critic_weight,
-                entropy_weight,
-            )
+        actor_loss = -(log_prob * td_error.detach()) - entropy_weight * entropy
+        critic_loss = criterion(state_value, target_value)
+        loss = actor_loss + critic_weight * critic_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
 
         if terminated or truncated:
-            while transition_buffer:
-                target_value = get_n_step_target(
-                    model,
-                    transition_buffer,
-                    discount_factor,
-                    len(transition_buffer),
-                )
-                oldest = transition_buffer.popleft()
-
-                log_prob, state_value, entropy = evaluate_given_action(
-                    model,
-                    oldest["obs"],
-                    oldest["action"],
-                )
-
-                ac_training_step(
-                    model,
-                    optimizer,
-                    criterion,
-                    state_value,
-                    target_value,
-                    log_prob,
-                    entropy,
-                    critic_weight,
-                    entropy_weight,
-                )
-
             return total_rewards
 
         obs = next_obs
@@ -306,7 +261,7 @@ def linear_anneal(start_value, end_value, current_step, anneal_steps):
     progress = min(current_step / anneal_steps, 1.0)
     return start_value + progress * (end_value - start_value)
 
-def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_start, entropy_weight_end, entropy_anneal_episodes, n_steps):
+def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_start, entropy_weight_end, entropy_anneal_episodes):
     return Path(
         f"ac_df{discount_factor}"
         f"_cw{critic_weight:0.3f}"
@@ -316,14 +271,13 @@ def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_
         f"_ews{entropy_weight_start:0.6f}"
         f"_ewe{entropy_weight_end:0.6f}"
         f"_ewa{entropy_anneal_episodes}"
-        f"_ns{n_steps}"
     )
 
-def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight_start=0.001, entropy_weight_end=0.0001, entropy_anneal_episodes=400, n_steps=5, resume=True):
+def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight_start=0.001, entropy_weight_end=0.0001, entropy_anneal_episodes=400, resume=True):
     totals = []
     best_avg = -float("inf")
 
-    ac_dir_path = get_ac_path(discount_factor, critic_weight, model.size, model.depth, optimizer.param_groups[0]['lr'], entropy_weight_start, entropy_weight_end, entropy_anneal_episodes, n_steps)
+    ac_dir_path = get_ac_path(discount_factor, critic_weight, model.size, model.depth, optimizer.param_groups[0]['lr'], entropy_weight_start, entropy_weight_end, entropy_anneal_episodes)
     ac_dir_path.mkdir(exist_ok=True)
     
     latest_ac_path = ac_dir_path / Path("latest_actor_critic.pt")
@@ -347,7 +301,7 @@ def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discoun
             episode,
             entropy_anneal_episodes,
         )
-        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, current_entropy_weight, n_steps, seed=seed)
+        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, current_entropy_weight, seed=seed)
         totals.append(total_rewards)
 
         if len(totals) >= 100:
