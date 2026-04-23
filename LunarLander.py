@@ -4,6 +4,126 @@ import torch.nn as nn
 import numpy as np
 from pathlib import Path
 from collections import deque
+import csv
+import json
+import random
+
+def set_global_seed(seed, deterministic_torch: bool = True):
+    if seed is None:
+        return
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic_torch:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def make_episode_rng(seed):
+    if seed is None:
+        return None
+    return np.random.default_rng(seed)
+
+
+def capture_rng_state(episode_rng):
+    state = {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "episode_rng_state": None if episode_rng is None else episode_rng.bit_generator.state,
+    }
+
+    if torch.cuda.is_available():
+        state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+
+    return state
+
+
+def restore_rng_state(checkpoint, seed):
+    has_rng_state = (
+        "python_random_state" in checkpoint
+        and "numpy_random_state" in checkpoint
+        and "torch_rng_state" in checkpoint
+        and "episode_rng_state" in checkpoint
+    )
+
+    if has_rng_state:
+        random.setstate(checkpoint["python_random_state"])
+        np.random.set_state(checkpoint["numpy_random_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+
+        if torch.cuda.is_available() and "torch_cuda_rng_state_all" in checkpoint:
+            torch.cuda.set_rng_state_all(checkpoint["torch_cuda_rng_state_all"])
+
+        if checkpoint["episode_rng_state"] is None:
+            episode_rng = None
+        else:
+            episode_rng = np.random.default_rng()
+            episode_rng.bit_generator.state = checkpoint["episode_rng_state"]
+
+        return episode_rng
+
+    # fallback for old checkpoints
+    set_global_seed(seed)
+    return make_episode_rng(seed)
+
+
+def add_rng_state_to_checkpoint(checkpoint_data, episode_rng):
+    checkpoint_data.update(capture_rng_state(episode_rng))
+    return checkpoint_data
+
+def next_episode_seed(rng):
+    if rng is None:
+        return None
+    return int(rng.integers(0, 2**32 - 1, dtype=np.uint32))
+
+def summarize_curve(values, window=100):
+    arr = np.asarray(values, dtype=np.float64)
+
+    out = {
+        "episodes": int(len(arr)),
+        "mean_all": float(arr.mean()) if len(arr) else None,
+        "std_all": float(arr.std()) if len(arr) else None,
+        "min_all": float(arr.min()) if len(arr) else None,
+        "max_all": float(arr.max()) if len(arr) else None,
+    }
+
+    if len(arr) >= window:
+        ma = np.convolve(arr, np.ones(window) / window, mode="valid")
+        out["mean_last_100"] = float(arr[-100:].mean())
+        out["best_100avg"] = float(ma.max())
+    else:
+        out["mean_last_100"] = None
+        out["best_100avg"] = None
+
+    return out
+
+def save_seed_sweep_results(save_dir, summary_rows, full_results, stem="seed_sweep"):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # full curves / losses / metadata
+    torch.save(full_results, save_dir / f"{stem}_full.pt")
+
+    # json summary
+    with open(save_dir / f"{stem}_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary_rows, f, indent=2)
+
+    # csv summary
+    if summary_rows:
+        fieldnames = list(summary_rows[0].keys())
+        with open(save_dir / f"{stem}_summary.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+
 
 # REINFORCE Policy Gradient Algorithm
 class PolicyNetwork(nn.Module):
@@ -89,70 +209,96 @@ def run_episode(model, env, seed=None): #Offline episode log prob and reward col
         if (done or truncated):
             return log_probs, rewards
 
-def get_reinforce_path(discount_factor, size, depth, lr):
-    return Path(f"reinforce_df{discount_factor}_size{size}_depth{depth}_lr{lr:0.6f}")
+def get_reinforce_path(discount_factor, size, depth, lr, seed=None):
+    seed_part = "" if seed is None else f"_seed{seed}"
+    return Path("reinforce_models") / Path(
+        f"reinforce_df{discount_factor}"
+        f"_size{size}"
+        f"_depth{depth}"
+        f"_lr{lr:0.6f}"
+        f"{seed_part}"
+    )
 
-def train_reinforce(model, optimizer, env, n_episodes, discount_factor,  resume=True):
+def train_reinforce(model, optimizer, env, n_episodes, discount_factor, resume=True, seed=None):
     model.train()
-    reinforce_dir_path = get_reinforce_path(discount_factor, model.size, model.depth, optimizer.param_groups[0]['lr'])
+    reinforce_dir_path = get_reinforce_path(
+        discount_factor,
+        model.size,
+        model.depth,
+        optimizer.param_groups[0]['lr'],
+        seed=seed,
+    )
+    reinforce_dir_path.mkdir(exist_ok=True, parents=True)
 
-    reinforce_dir_path.mkdir(exist_ok=True)
-    
     latest_reinforce_path = reinforce_dir_path / Path("latest_reinforce.pt")
     best_reinforce_path = reinforce_dir_path / Path("best_reinforce.pt")
 
     start_episode = 0
     totals = []
     best_avg = -float("inf")
-
+    set_global_seed(seed)
     
-    if (resume and latest_reinforce_path.exists()):
+    checkpoint = None
+    if resume and latest_reinforce_path.exists():
         checkpoint = torch.load(latest_reinforce_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         totals = checkpoint["totals"]
         best_avg = checkpoint["best_avg"]
         start_episode = checkpoint["episode"] + 1
-    
+
+    episode_rng = restore_rng_state(checkpoint, seed) if checkpoint is not None else make_episode_rng(seed)
+
     for episode in range(start_episode, n_episodes):
-        seed = torch.randint(0, 2**32, size=()).item()
-        log_probs, rewards = run_episode(model, env, seed=seed)
+        episode_seed = next_episode_seed(episode_rng)
+        log_probs, rewards = run_episode(model, env, seed=episode_seed)
         returns = compute_returns(rewards, discount_factor)
 
         totals.append(sum(rewards))
-        
+
         std_returns = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-7)
         losses = [-logp * rt for logp, rt in zip(log_probs, std_returns)]
         loss = torch.stack(losses, dim=0).sum()
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
+
         if len(totals) >= 100:
             avg100 = np.mean(totals[-100:])
             if avg100 > best_avg:
                 best_avg = avg100
-                torch.save({
-                    'episode': episode,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'totals': totals,
+                best_ckpt = {
+                    "episode": episode,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "totals": totals,
                     "best_avg": best_avg,
                     "model": "reinforce",
                     "size": model.size,
-                    "depth": model.depth
-                }, best_reinforce_path)
-        torch.save({
-                'episode': episode,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'totals': totals,
-                "best_avg": best_avg,
-                "model": "reinforce",
-                "size": model.size,
-                "depth": model.depth
-            }, latest_reinforce_path)
+                    "depth": model.depth,
+                    "seed": seed,
+                }
+                add_rng_state_to_checkpoint(best_ckpt, episode_rng)
+                torch.save(best_ckpt, best_reinforce_path)
+
+        latest_ckpt = {
+            "episode": episode,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "totals": totals,
+            "best_avg": best_avg,
+            "model": "reinforce",
+            "size": model.size,
+            "depth": model.depth,
+            "seed": seed,
+        }
+        add_rng_state_to_checkpoint(latest_ckpt, episode_rng)
+        torch.save(latest_ckpt, latest_reinforce_path)
+
         print(f"\rEpisode {episode + 1}, Reward: {sum(rewards):.2f}", end=" ")
+
     model.eval()
     return totals
     
@@ -261,8 +407,9 @@ def linear_anneal(start_value, end_value, current_step, anneal_steps):
     progress = min(current_step / anneal_steps, 1.0)
     return start_value + progress * (end_value - start_value)
 
-def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_start, entropy_weight_end, entropy_anneal_episodes):
-    return Path(
+def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_start, entropy_weight_end, entropy_anneal_episodes, seed=None):
+    seed_part = "" if seed is None else f"_seed{seed}"
+    return Path("ac_models") / Path(
         f"ac_df{discount_factor}"
         f"_cw{critic_weight:0.3f}"
         f"_size{size}"
@@ -271,78 +418,109 @@ def get_ac_path(discount_factor, critic_weight, size, depth, lr, entropy_weight_
         f"_ews{entropy_weight_start:0.6f}"
         f"_ewe{entropy_weight_end:0.6f}"
         f"_ewa{entropy_anneal_episodes}"
+        f"{seed_part}"
     )
 
-def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight_start=0.001, entropy_weight_end=0.0001, entropy_anneal_episodes=400, resume=True):
+def train_actor_critic(model, optimizer, criterion, env, n_episodes=400, discount_factor=0.95, critic_weight=0.3, entropy_weight_start=0.001, entropy_weight_end=0.0001, entropy_anneal_episodes=400, resume=True, seed=None):
     totals = []
     best_avg = -float("inf")
 
-    ac_dir_path = get_ac_path(discount_factor, critic_weight, model.size, model.depth, optimizer.param_groups[0]['lr'], entropy_weight_start, entropy_weight_end, entropy_anneal_episodes)
-    ac_dir_path.mkdir(exist_ok=True)
-    
+    ac_dir_path = get_ac_path(
+        discount_factor,
+        critic_weight,
+        model.size,
+        model.depth,
+        optimizer.param_groups[0]['lr'],
+        entropy_weight_start,
+        entropy_weight_end,
+        entropy_anneal_episodes,
+        seed=seed,
+    )
+    ac_dir_path.mkdir(exist_ok=True, parents=True)
+
     latest_ac_path = ac_dir_path / Path("latest_actor_critic.pt")
     best_ac_path = ac_dir_path / Path("best_actor_critic.pt")
-    
+
     start_episode = 0
-    if (resume and latest_ac_path.exists()):
+
+    set_global_seed(seed)
+    checkpoint = None
+    if resume and latest_ac_path.exists():
         checkpoint = torch.load(latest_ac_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         totals = checkpoint["totals"]
         best_avg = checkpoint["best_avg"]
         start_episode = checkpoint["episode"] + 1
+
+    episode_rng = restore_rng_state(checkpoint, seed) if checkpoint is not None else make_episode_rng(seed)
     
+
     model.train()
     for episode in range(start_episode, n_episodes):
-        seed = torch.randint(0, 2**32, size=()).item()
+        episode_seed = next_episode_seed(episode_rng)
+
         current_entropy_weight = linear_anneal(
             entropy_weight_start,
             entropy_weight_end,
             episode,
             entropy_anneal_episodes,
         )
-        total_rewards = run_episode_and_train_ac(model, optimizer, criterion, env, discount_factor, critic_weight, current_entropy_weight, seed=seed)
+
+        total_rewards = run_episode_and_train_ac(
+            model,
+            optimizer,
+            criterion,
+            env,
+            discount_factor,
+            critic_weight,
+            current_entropy_weight,
+            seed=episode_seed,
+        )
         totals.append(total_rewards)
 
         if len(totals) >= 100:
             avg100 = np.mean(totals[-100:])
             if avg100 > best_avg:
                 best_avg = avg100
-                torch.save({
-                    'episode': episode,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'totals': totals,
+                best_ckpt = {
+                    "episode": episode,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "totals": totals,
                     "best_avg": best_avg,
                     "model": "ac",
                     "size": model.size,
-                    "depth": model.depth
-                }, best_ac_path)
-        
-        torch.save({
-                'episode': episode,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'totals': totals,
-                "best_avg": best_avg,
-                "model": "ac",
-                "size": model.size,
-                "depth": model.depth
-            }, latest_ac_path)
-        
-                
+                    "depth": model.depth,
+                    "seed": seed,
+                }
+                add_rng_state_to_checkpoint(best_ckpt, episode_rng)
+                torch.save(best_ckpt, best_ac_path)
+
+        latest_ckpt = {
+            "episode": episode,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "totals": totals,
+            "best_avg": best_avg,
+            "model": "ac",
+            "size": model.size,
+            "depth": model.depth,
+            "seed": seed,
+        }
+        add_rng_state_to_checkpoint(latest_ckpt, episode_rng)
+        torch.save(latest_ckpt, latest_ac_path)
+
         print(
             f"\rEpisode: {episode + 1}, Reward: {total_rewards:.2f}, "
             f"Avg100: {np.mean(totals[-100:]):.2f}, EW: {current_entropy_weight:.6f}",
             end=""
-        )  
+        )
 
     model.eval()
     return totals
 
 
-
-import random
 
 
 class DQN(nn.Module):
@@ -528,8 +706,10 @@ def get_dqn_path(
     ac_guidance_start=0.0,
     ac_guidance_end=0.0,
     ac_guidance_anneal_episodes=0,
+    seed=None,
 ):
-    return Path(
+    seed_part = "" if seed is None else f"_seed{seed}"
+    return Path("dqn_models")/ Path(
         f"dqn_df{discount_factor}"
         f"_size{size}"
         f"_depth{depth}"
@@ -543,6 +723,7 @@ def get_dqn_path(
         f"_acgs{ac_guidance_start:0.2f}"
         f"_acge{ac_guidance_end:0.2f}"
         f"_acga{ac_guidance_anneal_episodes}"
+        f"{seed_part}"
     )
 
 
@@ -563,11 +744,12 @@ def train_dqn(
     warmup_steps=1000,
     train_freq=1,
     resume=True,
-    save_replay_buffer=False,
+    save_replay_buffer=True,
     ac_model=None,
     ac_guidance_start=0.5,
     ac_guidance_end=0.0,
     ac_guidance_anneal_episodes=150,
+    seed=None,
 ):
     totals = []
     losses = []
@@ -589,13 +771,16 @@ def train_dqn(
         ac_guidance_start=ac_guidance_start,
         ac_guidance_end=ac_guidance_end,
         ac_guidance_anneal_episodes=ac_guidance_anneal_episodes,
+        seed=seed,
     )
-    dqn_dir_path.mkdir(exist_ok=True)
+    dqn_dir_path.mkdir(exist_ok=True, parents=True)
 
     latest_dqn_path = dqn_dir_path / Path("latest_dqn.pt")
     best_dqn_path = dqn_dir_path / Path("best_dqn.pt")
 
     start_episode = 0
+    checkpoint = None
+    set_global_seed(seed)
 
     if resume and latest_dqn_path.exists():
         checkpoint = torch.load(latest_dqn_path, weights_only=False)
@@ -608,19 +793,23 @@ def train_dqn(
         start_episode = checkpoint["episode"] + 1
         global_step = checkpoint.get("global_step", 0)
 
-        if save_replay_buffer and "replay_buffer" in checkpoint:
+        if "replay_buffer" in checkpoint:
             replay_buffer = deque(checkpoint["replay_buffer"], maxlen=buffer_size)
+        elif save_replay_buffer:
+            raise ValueError("Deterministic DQN resume requires replay_buffer in checkpoint, but it was not found.")
     else:
         target_model.load_state_dict(policy_model.state_dict())
 
     if ac_model is not None:
         ac_model.eval()
 
+    episode_rng = restore_rng_state(checkpoint, seed) if checkpoint is not None else make_episode_rng(seed)
+
     policy_model.train()
     target_model.eval()
 
     for episode in range(start_episode, n_episodes):
-        seed = torch.randint(0, 2**32, size=()).item()
+        episode_seed = next_episode_seed(episode_rng)
 
         epsilon = linear_anneal(
             epsilon_start,
@@ -628,14 +817,14 @@ def train_dqn(
             episode,
             epsilon_decay_episodes,
         )
-    
+
         current_ac_guidance = linear_anneal(
             ac_guidance_start,
             ac_guidance_end,
             episode,
             ac_guidance_anneal_episodes,
         )
-    
+
         total_rewards, avg_loss, global_step = run_episode_and_train_dqn(
             policy_model,
             target_model,
@@ -649,12 +838,12 @@ def train_dqn(
             warmup_steps=warmup_steps,
             train_freq=train_freq,
             target_update_freq=target_update_freq,
-            seed=seed,
+            seed=episode_seed,
             global_step=global_step,
             ac_model=ac_model,
             ac_guidance_prob=current_ac_guidance,
         )
-    
+
         totals.append(total_rewards)
         losses.append(avg_loss)
 
@@ -673,10 +862,11 @@ def train_dqn(
             "ac_guidance_start": ac_guidance_start,
             "ac_guidance_end": ac_guidance_end,
             "ac_guidance_anneal_episodes": ac_guidance_anneal_episodes,
+            "seed": seed,
+            "replay_buffer": list(replay_buffer),
         }
 
-        if save_replay_buffer:
-            checkpoint_data["replay_buffer"] = list(replay_buffer)
+        add_rng_state_to_checkpoint(checkpoint_data, episode_rng)
 
         if len(totals) >= 100:
             avg100 = np.mean(totals[-100:])
@@ -697,6 +887,258 @@ def train_dqn(
     policy_model.eval()
     return totals, losses
 
+def run_dqn_seed_sweep(
+    seeds,
+    size,
+    depth,
+    lr,
+    n_episodes=400,
+    discount_factor=0.99,
+    buffer_size=50000,
+    batch_size=64,
+    target_update_freq=250,
+    epsilon_start=1.0,
+    epsilon_end=0.05,
+    epsilon_decay_episodes=300,
+    warmup_steps=1000,
+    train_freq=1,
+    resume=True,
+    ac_model=None,
+    ac_guidance_start=0.0,
+    ac_guidance_end=0.0,
+    ac_guidance_anneal_episodes=1,
+    env_name="LunarLander-v2",
+    save_root="seed_sweeps",
+):
+    summary_rows = []
+    full_results = {}
+
+    for seed in seeds:
+        print(f"\n===== DQN seed {seed} =====")
+
+        set_global_seed(seed)
+        env = gym.make(env_name)
+
+        dqn_model = DQN(size, depth)
+        target_model = DQN(size, depth)
+        optimizer = torch.optim.Adam(dqn_model.parameters(), lr=lr)
+        criterion = nn.SmoothL1Loss()
+
+        totals, losses = train_dqn(
+            policy_model=dqn_model,
+            target_model=target_model,
+            optimizer=optimizer,
+            criterion=criterion,
+            env=env,
+            n_episodes=n_episodes,
+            discount_factor=discount_factor,
+            buffer_size=buffer_size,
+            batch_size=batch_size,
+            target_update_freq=target_update_freq,
+            epsilon_start=epsilon_start,
+            epsilon_end=epsilon_end,
+            epsilon_decay_episodes=epsilon_decay_episodes,
+            warmup_steps=warmup_steps,
+            train_freq=train_freq,
+            resume=resume,
+            save_replay_buffer=True,
+            ac_model=ac_model,
+            ac_guidance_start=ac_guidance_start,
+            ac_guidance_end=ac_guidance_end,
+            ac_guidance_anneal_episodes=ac_guidance_anneal_episodes,
+            seed=seed,
+        )
+
+        run_summary = summarize_curve(totals, window=100)
+        run_summary.update({
+            "seed": seed,
+            "model": "dqn",
+            "size": size,
+            "depth": depth,
+            "lr": lr,
+            "discount_factor": discount_factor,
+            "buffer_size": buffer_size,
+            "batch_size": batch_size,
+            "target_update_freq": target_update_freq,
+            "epsilon_start": epsilon_start,
+            "epsilon_end": epsilon_end,
+            "epsilon_decay_episodes": epsilon_decay_episodes,
+            "ac_guidance_start": ac_guidance_start,
+            "ac_guidance_end": ac_guidance_end,
+            "ac_guidance_anneal_episodes": ac_guidance_anneal_episodes,
+            "final_loss": float(losses[-1]) if len(losses) else None,
+            "mean_loss_last_50": float(np.mean(losses[-50:])) if len(losses) >= 50 else (float(np.mean(losses)) if len(losses) else None),
+        })
+        summary_rows.append(run_summary)
+
+        full_results[seed] = {
+            "totals": totals,
+            "losses": losses,
+        }
+
+        env.close()
+
+    save_dir = Path(save_root) / (
+        f"dqn_size{size}_depth{depth}_lr{lr:0.6f}"
+        f"_df{discount_factor}_batch{batch_size}"
+    )
+    save_seed_sweep_results(
+        save_dir=save_dir,
+        summary_rows=summary_rows,
+        full_results=full_results,
+        stem="dqn_seed_sweep",
+    )
+
+    return summary_rows, full_results
+
+
+def run_ac_seed_sweep(
+    seeds,
+    size,
+    depth,
+    lr,
+    n_episodes=400,
+    discount_factor=0.95,
+    critic_weight=0.3,
+    entropy_weight_start=0.001,
+    entropy_weight_end=0.0001,
+    entropy_anneal_episodes=400,
+    resume=True,
+    env_name="LunarLander-v2",
+    save_root="seed_sweeps",
+):
+    summary_rows = []
+    full_results = {}
+
+    for seed in seeds:
+        print(f"\n===== AC seed {seed} =====")
+
+        set_global_seed(seed)
+        env = gym.make(env_name)
+
+        ac_model = ActorCritic(size, depth)
+        optimizer = torch.optim.Adam(ac_model.parameters(), lr=lr)
+        criterion = nn.SmoothL1Loss()
+
+        totals = train_actor_critic(
+            model=ac_model,
+            optimizer=optimizer,
+            criterion=criterion,
+            env=env,
+            n_episodes=n_episodes,
+            discount_factor=discount_factor,
+            critic_weight=critic_weight,
+            entropy_weight_start=entropy_weight_start,
+            entropy_weight_end=entropy_weight_end,
+            entropy_anneal_episodes=entropy_anneal_episodes,
+            resume=resume,
+            seed=seed,
+        )
+
+        run_summary = summarize_curve(totals, window=100)
+        run_summary.update({
+            "seed": seed,
+            "model": "actor_critic",
+            "size": size,
+            "depth": depth,
+            "lr": lr,
+            "discount_factor": discount_factor,
+            "critic_weight": critic_weight,
+            "entropy_weight_start": entropy_weight_start,
+            "entropy_weight_end": entropy_weight_end,
+            "entropy_anneal_episodes": entropy_anneal_episodes,
+        })
+
+        summary_rows.append(run_summary)
+        full_results[seed] = {
+            "totals": totals,
+        }
+
+        env.close()
+
+    save_dir = Path(save_root) / (
+        f"ac_size{size}_depth{depth}_lr{lr:0.6f}"
+        f"_df{discount_factor}"
+        f"_cw{critic_weight:0.3f}"
+        f"_ews{entropy_weight_start:0.6f}"
+        f"_ewe{entropy_weight_end:0.6f}"
+        f"_ewa{entropy_anneal_episodes}"
+    )
+
+    save_seed_sweep_results(
+        save_dir=save_dir,
+        summary_rows=summary_rows,
+        full_results=full_results,
+        stem="ac_seed_sweep",
+    )
+
+    return summary_rows, full_results
+
+
+def run_reinforce_seed_sweep(
+    seeds,
+    size,
+    depth,
+    lr,
+    n_episodes=400,
+    discount_factor=0.99,
+    resume=True,
+    env_name="LunarLander-v2",
+    save_root="seed_sweeps",
+):
+    summary_rows = []
+    full_results = {}
+
+    for seed in seeds:
+        print(f"\n===== REINFORCE seed {seed} =====")
+
+        set_global_seed(seed)
+        env = gym.make(env_name)
+
+        model = PolicyNetwork(size, depth)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        totals = train_reinforce(
+            model=model,
+            optimizer=optimizer,
+            env=env,
+            n_episodes=n_episodes,
+            discount_factor=discount_factor,
+            resume=resume,
+            seed=seed,
+        )
+
+        run_summary = summarize_curve(totals, window=100)
+        run_summary.update({
+            "seed": seed,
+            "model": "reinforce",
+            "size": size,
+            "depth": depth,
+            "lr": lr,
+            "discount_factor": discount_factor,
+        })
+
+        summary_rows.append(run_summary)
+        full_results[seed] = {
+            "totals": totals,
+        }
+
+        env.close()
+
+    save_dir = Path(save_root) / (
+        f"reinforce_size{size}_depth{depth}_lr{lr:0.6f}"
+        f"_df{discount_factor}"
+    )
+
+    save_seed_sweep_results(
+        save_dir=save_dir,
+        summary_rows=summary_rows,
+        full_results=full_results,
+        stem="reinforce_seed_sweep",
+    )
+
+    return summary_rows, full_results
+
 
 def load_model_for_eval(path):
     checkpoint = torch.load(path, weights_only=False)
@@ -712,7 +1154,6 @@ def load_model_for_eval(path):
         model = DQN(size, depth)
         
 
-    checkpoint = torch.load(path, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -784,8 +1225,7 @@ if __name__ == "__main__":
         print(f"Episode rewards total: {mean}")
         final_totals.append(mean)
     
-    window = np.max([100, episode])
-    print("Final convolve: ", np.convolve(final_totals, np.ones(window), 'valid') / window)
+
     print("Final: ")
     print(np.mean(final_totals),np.std(final_totals),min(final_totals),max(final_totals))
 
