@@ -1,4 +1,8 @@
-# Lunar Lander Reinforcement Learning Study
+# Lunar Lander Reinforcement Learning
+
+![Best DQN latest checkpoint](docs/GIFs/best_dqn_config_latest.gif)
+
+<small>Latest checkpoint from the strongest DQN configuration in the study.</small>
 
 ## Overview
 
